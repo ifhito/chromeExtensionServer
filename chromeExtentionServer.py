@@ -15,6 +15,20 @@ from flask_sqlalchemy import SQLAlchemy
 # from sqlalchemy import exc
 from datetime import datetime
 import time
+import requests
+import pandas as pd
+from bs4 import BeautifulSoup
+import MeCab
+import gensim
+import numpy as np
+import cchardet
+
+mecab = MeCab.Tagger('-d /usr/local/lib/mecab/dic/mecab-ipadic-neologd')
+mecab.parse('')
+model = gensim.models.KeyedVectors.load_word2vec_format('cc.ja.300.bin', binary=True)
+# model = gensim.models.KeyedVectors.load_word2vec_format('cc.ja.300.bin', binary=True)
+# model.save_word2vec_format('cc.ja.300.bin', binary=True)
+
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///highlight.sqlite3?check_same_thread=False'
 db = SQLAlchemy(app)
@@ -257,6 +271,111 @@ def deleteData():
         return 'ok'
     except Exception as error:
         print(error)
+
+# テキストのベクトルを計算
+def get_vector(text):
+    # sum_vec = np.zeros(200)
+    sum_vec = np.zeros(300) #ここが200のままだとsum_vec += model.wv[item.split('\t')[0]]の部分でbroadcastエラーになる。
+    word_count = 0
+    # python3.7.1だとparseToNodeメソッドでうまく形態素解析できないためparse()とsplitlines(), split()で書き直した
+    node = mecab.parse(text).splitlines()
+    for item in node:
+        if item.split('\t')[0]=='EOS':
+            break
+        field = item.split('\t')[1].split(',')[0]
+        if field == '名詞' or field == '動詞' or field == '形容詞':
+            try:
+                sum_vec += model.wv[item.split('\t')[0]]
+                word_count += 1
+            except KeyError as error:
+                continue
+    return sum_vec / word_count
+ 
+ 
+# cos類似度を計算
+def cos_sim(v1, v2):
+    return np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+
+def sentence_sim(sentence1, sentence2):
+    v1 = get_vector(sentence1)
+    v2 = get_vector(sentence2)
+    return cos_sim(v1, v2)
+
+@app.route('/scrapingData', methods=['POST'])
+@cross_origin()
+def scrapingData():
+    try:
+        res = request.json
+        url = res['urls']
+        print(url)
+        user_id = res['userId']
+        bookmark_text = db.session.query(Entry.selectText).filter(Entry.userID == str(user_id),Entry.flag == True).all()
+        html=requests.get(url)
+        html.encoding = cchardet.detect(html.content)['encoding']
+        soup=BeautifulSoup(html.text,"html.parser")
+        for script in soup(["script", "style"]):
+            script.decompose()
+        text=soup.get_text()
+        lines= [line.strip() for line in text.splitlines()]
+        text=[line for line in lines if line]
+        sentence_sims = []
+        sim = 0
+        for sentence in text:
+            sim = 0
+            if len(sentence) >= 15:
+                for bookmark in bookmark_text:
+                    text_sim = sentence_sim(sentence, bookmark[0])
+                    if text_sim != None:
+                        sim += text_sim
+                    #print(bookmark[0])
+            sentence_sims.append([sentence, sim])
+        sorted_sentence_sims = sorted(sentence_sims, key=lambda x: np.inf if np.isnan(x[1]) else x[1], reverse=True)
+        print(sorted_sentence_sims)
+        n = 0
+        final_text = ''
+        if len(sorted_sentence_sims) < 3:
+            while n <= len(sorted_sentence_sims):
+                final_text += sorted_sentence_sims[n][0] + '\n'
+                n += 1
+            return jsonify({'sentence': final_text})
+        while n <= 3:
+            final_text += sorted_sentence_sims[n][0] + '\n'
+            n += 1
+        return jsonify({'sentence': final_text})
+    except Exception as error:
+        print('error')
+        return jsonify({'sentence': 'error'})
+
+# @app.route('/scrapingData', methods=['POST'])
+# @cross_origin()
+# def scrapingData():
+#     res = request.json
+#     url = res['urls']
+#     user_id = res['userId']
+#     #bookmark_text = db.session.query(Entry.selectText).filter(Entry.userID == str(user_id),Entry.flag == True).all()
+#     html=requests.get(url).text
+#     soup=BeautifulSoup(html,"html.parser")
+#     for script in soup(["script", "style"]):
+#         script.decompose()
+#     text=soup.get_text()
+#     lines= [line.strip() for line in text.splitlines()]
+#     text=[line for line in lines if line]
+    # sentence_sim = []
+    # sim = 0
+    # for sentence in text:
+    #     sim = 0
+    #     for bookmark in bookmark_text:
+    #         sim += sentence_sim(sentence, bookmark)
+    
+    #     sentence_sim.append([sentence, sim])
+    # sorted_sentence_sim = sorted(sentence_sim, key=lambda x: x[1], reverse=True)
+    # n = 0
+    # final_text = []
+    # while True:
+    #     final_text.append(sorted_sentence_sim[n][0])
+    #     n += 1
+    return jsonify({'sentence': text})
+
 # @app.teardown_appcontext
 # def session_clear(exception):
 #     if exception and Session.is_active:
